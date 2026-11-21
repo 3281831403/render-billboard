@@ -35,9 +35,58 @@ __all__ = [
 
 EPS = 1e-6
 
+_ORIENTATION_MODES = ("full", "yaw", "axial")
+_SCALE_MODES = ("perspective", "screen", "world")
+_WORLD_UP = (0.0, 1.0, 0.0)
+_FALLBACK_UP = (0.0, 0.0, 1.0)
+
 
 class BillboardError(ValueError):
     """Raised when billboard input is malformed or a batch is rejected."""
+
+
+def _is_real(value: object) -> bool:
+    """True for finite real numbers, excluding booleans and non-finite floats."""
+
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    return math.isfinite(value)
+
+
+def _is_vector(value: object) -> bool:
+    """True for finite 3-vectors (tuples or lists of three real numbers)."""
+
+    return (
+        isinstance(value, (tuple, list))
+        and len(value) == 3
+        and all(_is_real(component) for component in value)
+    )
+
+
+def _sub(a, b):
+    return (a[0] - b[0], a[1] - b[1], a[2] - b[2])
+
+
+def _add(a, b):
+    return (a[0] + b[0], a[1] + b[1], a[2] + b[2])
+
+
+def _scale(s, v):
+    return (s * v[0], s * v[1], s * v[2])
+
+
+def _dot(a, b):
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+
+
+def _cross_raw(a, b):
+    """Cross product without input or zero-length validation (internal use)."""
+
+    return (
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    )
 
 
 def cross(a: tuple[float, float, float], b: tuple[float, float, float]) -> tuple[float, float, float]:
@@ -53,7 +102,12 @@ def cross(a: tuple[float, float, float], b: tuple[float, float, float]) -> tuple
     Results are compared with a tolerance of ``1e-6``.
     """
 
-    raise NotImplementedError("cross is not implemented")
+    if not _is_vector(a) or not _is_vector(b):
+        raise BillboardError("cross requires two finite 3-vectors")
+    result = _cross_raw(a, b)
+    if math.sqrt(_dot(result, result)) <= EPS:
+        raise BillboardError("cross product of parallel or zero vectors is undefined")
+    return result
 
 
 def normalize(v: tuple[float, float, float]) -> tuple[float, float, float]:
@@ -67,7 +121,22 @@ def normalize(v: tuple[float, float, float]) -> tuple[float, float, float]:
     tolerance of ``1e-6``.
     """
 
-    raise NotImplementedError("normalize is not implemented")
+    if not _is_vector(v):
+        raise BillboardError("normalize requires a finite 3-vector")
+    length = math.sqrt(_dot(v, v))
+    if length <= EPS:
+        raise BillboardError("cannot normalize a zero-length vector")
+    return (v[0] / length, v[1] / length, v[2] / length)
+
+
+def _yaw_frame(offset):
+    """Build the upright, Y-locked frame for a camera offset vector."""
+
+    horizontal = (offset[0], 0.0, offset[2])
+    normal = normalize(horizontal)
+    up = _WORLD_UP
+    right = normalize(cross(up, normal))
+    return right, up, normal
 
 
 def face_camera(
@@ -106,7 +175,26 @@ def face_camera(
     compared with a tolerance of ``1e-6``.
     """
 
-    raise NotImplementedError("face_camera is not implemented")
+    if mode not in _ORIENTATION_MODES:
+        raise BillboardError(f"unknown mode: {mode}")
+    if not _is_vector(base) or not _is_vector(cam_pos):
+        raise BillboardError("base and camera position must be finite 3-vectors")
+
+    offset = _sub(cam_pos, base)
+    if math.sqrt(_dot(offset, offset)) <= EPS:
+        raise BillboardError("camera coincides with base")
+
+    if mode in ("yaw", "axial"):
+        return _yaw_frame(offset)
+
+    normal = normalize(offset)
+    reference = _WORLD_UP
+    candidate = _cross_raw(reference, normal)
+    if math.sqrt(_dot(candidate, candidate)) <= EPS:
+        reference = _FALLBACK_UP
+    right = normalize(_cross_raw(reference, normal))
+    up = normalize(_cross_raw(normal, right))
+    return right, up, normal
 
 
 def screen_scale(
@@ -137,7 +225,18 @@ def screen_scale(
     ``1e-6``.
     """
 
-    raise NotImplementedError("screen_scale is not implemented")
+    if mode not in _SCALE_MODES:
+        raise BillboardError(f"unknown scale mode: {mode}")
+    if not _is_real(distance) or distance <= 0.0:
+        raise BillboardError("distance must be finite and greater than zero")
+    if not _is_real(fov) or not 0.0 < fov < math.pi:
+        raise BillboardError("fov must satisfy 0 < fov < pi")
+    if not _is_real(base_size) or base_size < 0.0:
+        raise BillboardError("base_size must be finite and non-negative")
+
+    if mode == "perspective":
+        return base_size / (2.0 * distance * math.tan(fov / 2.0))
+    return base_size
 
 
 def align_up(
@@ -148,7 +247,6 @@ def align_up(
     ],
     cam_up: tuple[float, float, float],
 ) -> tuple[
-    tuple[float, float, float],
     tuple[float, float, float],
     tuple[float, float, float],
 ]:
@@ -170,7 +268,43 @@ def align_up(
     ``1e-6``.
     """
 
-    raise NotImplementedError("align_up is not implemented")
+    if (
+        not isinstance(basis, (tuple, list))
+        or len(basis) != 3
+        or not all(_is_vector(axis) for axis in basis)
+    ):
+        raise BillboardError("basis must contain three finite 3-vectors")
+    if not _is_vector(cam_up):
+        raise BillboardError("camera up must be a finite 3-vector")
+
+    normal = normalize(basis[2])
+    projected = _sub(cam_up, _scale(_dot(cam_up, normal), normal))
+    if math.sqrt(_dot(projected, projected)) <= EPS:
+        raise BillboardError("camera up is parallel to the billboard normal")
+    up = normalize(projected)
+    right = normalize(cross(up, normal))
+    return right, up, normal
+
+
+def _validate_frame(basis):
+    """Check that a supplied basis is a finite orthonormal right-handed frame."""
+
+    if (
+        not isinstance(basis, (tuple, list))
+        or len(basis) != 3
+        or not all(_is_vector(axis) for axis in basis)
+    ):
+        raise BillboardError("basis must contain three finite 3-vectors")
+    right, up, normal = basis
+    for axis in (right, up, normal):
+        if abs(math.sqrt(_dot(axis, axis)) - 1.0) > EPS:
+            raise BillboardError("basis vectors must be unit length")
+    for a, b in ((right, up), (right, normal), (up, normal)):
+        if abs(_dot(a, b)) > EPS:
+            raise BillboardError("basis vectors must be mutually orthogonal")
+    expected = cross(right, up)
+    if any(abs(expected[i] - normal[i]) > EPS for i in range(3)):
+        raise BillboardError("basis must satisfy cross(right, up) == normal")
 
 
 def clamp_axis(
@@ -203,7 +337,14 @@ def clamp_axis(
     a tolerance of ``1e-6``.
     """
 
-    raise NotImplementedError("clamp_axis is not implemented")
+    _validate_frame(basis)
+    if not _is_vector(base) or not _is_vector(cam_pos):
+        raise BillboardError("base and camera position must be finite 3-vectors")
+
+    offset = _sub(cam_pos, base)
+    if math.sqrt(_dot(offset, offset)) <= EPS:
+        raise BillboardError("camera coincides with base")
+    return _yaw_frame(offset)
 
 
 def depth_shade(distance: float) -> float:
@@ -218,7 +359,9 @@ def depth_shade(distance: float) -> float:
     ``1e-6``.
     """
 
-    raise NotImplementedError("depth_shade is not implemented")
+    if not _is_real(distance) or distance < 0.0:
+        raise BillboardError("distance must be finite and non-negative")
+    return 1.0 / (1.0 + distance)
 
 
 def validate(
@@ -248,7 +391,93 @@ def validate(
     compared with a tolerance of ``1e-6``.
     """
 
-    raise NotImplementedError("validate is not implemented")
+    issues: list[str] = []
+    if not _is_vector(base):
+        issues.append("base must be a finite 3-vector")
+    elif all(component == 0.0 for component in base):
+        issues.append("base vector is zero")
+
+    if not _is_vector(cam_pos):
+        issues.append("camera position must be a finite 3-vector")
+
+    if mode not in _ORIENTATION_MODES:
+        issues.append(f"unknown mode: {mode}")
+
+    if _is_vector(base) and _is_vector(cam_pos):
+        offset = _sub(cam_pos, base)
+        if math.sqrt(_dot(offset, offset)) <= EPS:
+            issues.append("camera coincides with base")
+
+    return issues
+
+
+def _check_camera(camera: dict) -> None:
+    if not isinstance(camera, dict):
+        raise BillboardError("camera must be a dictionary")
+    for key in ("pos", "up", "forward"):
+        if key not in camera or not _is_vector(camera[key]):
+            raise BillboardError(f"camera {key} must be a finite 3-vector")
+    for key in ("up", "forward"):
+        if math.sqrt(_dot(camera[key], camera[key])) <= EPS:
+            raise BillboardError(f"camera {key} must be non-zero")
+
+
+def _check_config(config: dict) -> dict:
+    if not isinstance(config, dict):
+        raise BillboardError("config must be a dictionary")
+    settings = {
+        "mode": config.get("mode", "full"),
+        "scale_mode": config.get("scale_mode", "perspective"),
+        "fov": config.get("fov", math.pi / 2.0),
+        "base_size": config.get("base_size", 1.0),
+    }
+    if settings["mode"] not in _ORIENTATION_MODES:
+        raise BillboardError(f"unknown mode: {settings['mode']}")
+    if settings["scale_mode"] not in _SCALE_MODES:
+        raise BillboardError(f"unknown scale mode: {settings['scale_mode']}")
+    if not _is_real(settings["fov"]) or not 0.0 < settings["fov"] < math.pi:
+        raise BillboardError("fov must satisfy 0 < fov < pi")
+    if not _is_real(settings["base_size"]) or settings["base_size"] < 0.0:
+        raise BillboardError("base_size must be finite and non-negative")
+    return settings
+
+
+def _validate_instance(instance, camera, settings) -> list[str]:
+    if not isinstance(instance, dict):
+        return ["instance must be a dictionary"]
+
+    issues: list[str] = []
+    base = instance.get("base")
+    if not _is_vector(base):
+        issues.append("base must be a finite 3-vector")
+    elif all(component == 0.0 for component in base):
+        issues.append("base vector is zero")
+
+    mode = instance.get("mode", settings["mode"])
+    if mode not in _ORIENTATION_MODES:
+        issues.append(f"unknown mode: {mode}")
+
+    scale_mode = instance.get("scale_mode", settings["scale_mode"])
+    if scale_mode not in _SCALE_MODES:
+        issues.append(f"unknown scale mode: {scale_mode}")
+
+    size = instance.get("size", settings["base_size"])
+    if not _is_real(size) or size < 0.0:
+        issues.append("size must be finite and non-negative")
+
+    if issues:
+        return issues
+
+    issues.extend(validate(base, camera["pos"], mode))
+    if issues:
+        return issues
+
+    distance = math.sqrt(_dot(_sub(camera["pos"], base), _sub(camera["pos"], base)))
+    try:
+        screen_scale(distance, settings["fov"], size, scale_mode)
+    except BillboardError as exc:
+        issues.append(str(exc))
+    return issues
 
 
 def billboard_batch(
@@ -307,4 +536,45 @@ def billboard_batch(
     ``1e-6``.
     """
 
-    raise NotImplementedError("billboard_batch is not implemented")
+    if not isinstance(instances, (list, tuple)):
+        raise BillboardError("instances must be a sequence of dictionaries")
+    _check_camera(camera)
+    settings = _check_config(config)
+
+    errors: dict = {}
+    for index, instance in enumerate(instances):
+        instance_issues = _validate_instance(instance, camera, settings)
+        if instance_issues:
+            errors[index] = instance_issues
+    if errors:
+        return {"ok": False, "billboards": [], "errors": errors}
+
+    billboards = []
+    for instance in instances:
+        base = instance["base"]
+        mode = instance.get("mode", settings["mode"])
+        scale_mode = instance.get("scale_mode", settings["scale_mode"])
+        size = instance.get("size", settings["base_size"])
+
+        basis = face_camera(base, camera["pos"], mode)
+        if mode == "full":
+            basis = align_up(basis, camera["up"])
+
+        offset = _sub(camera["pos"], base)
+        distance = math.sqrt(_dot(offset, offset))
+        scale = screen_scale(distance, settings["fov"], size, scale_mode)
+        shade = depth_shade(distance)
+
+        billboards.append(
+            {
+                "base": base,
+                "mode": mode,
+                "size": size,
+                "basis": basis,
+                "distance": distance,
+                "scale": scale,
+                "shade": shade,
+            }
+        )
+
+    return {"ok": True, "billboards": billboards, "errors": {}}
